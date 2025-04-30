@@ -24,11 +24,23 @@ def fetch_latest_news():
             feed = feedparser.parse(feed_url)
             if feed.entries:
                 entry = feed.entries[0]  # فقط اولین (جدیدترین) خبر
+                # استخراج تصویر (از media:content یا enclosure)
+                image_url = None
+                if hasattr(entry, 'media_content') and entry.media_content:
+                    image_url = entry.media_content[0].get('url')
+                elif hasattr(entry, 'enclosure') and entry.enclosure:
+                    image_url = entry.enclosure[0].get('url')
+                
+                # استخراج سرفصل (subtitle یا description کوتاه)
+                subtitle = entry.get('subtitle', entry.get('description', '')[:200])
+                
                 news_items.append({
                     "title": entry.title,
+                    "subtitle": subtitle,
                     "content": entry.summary or entry.description,
                     "link": entry.link,
-                    "published": entry.get("published", "")  # برای مرتب‌سازی
+                    "image_url": image_url,
+                    "published": entry.get("published", "")
                 })
         except Exception as e:
             print(f"خطا در دریافت فید {feed_url}: {e}")
@@ -36,7 +48,7 @@ def fetch_latest_news():
     # مرتب‌سازی بر اساس زمان انتشار و انتخاب جدیدترین
     if news_items:
         latest_news = sorted(news_items, key=lambda x: x["published"], reverse=True)[0]
-        return [latest_news]  # فقط آخرین خبر
+        return [latest_news]
     return []
 
 # تابع برای ارسال درخواست به جمینی با مدیریت خطای 429
@@ -102,7 +114,7 @@ def rewrite_with_gemini(content):
     return call_gemini(prompt)
 
 # تابع برای انتشار پست در بلاگر
-def publish_to_blogger(title, content):
+def publish_to_blogger(news):
     try:
         # بررسی متغیر محیطی
         credentials = os.environ.get("CREDENTIALS")
@@ -118,12 +130,33 @@ def publish_to_blogger(title, content):
         # ایجاد سرویس بلاگر
         service = build("blogger", "v3", credentials=creds)
         
+        # بازنویسی متن
+        rewritten_content = rewrite_with_gemini(news["content"])
+        if not rewritten_content:
+            print(f"بازنویسی برای {news['title']} ناموفق بود.")
+            return None
+        
+        # قالب‌بندی محتوا به‌صورت HTML
+        content_html = f"""
+        <h1>{news['title']}</h1>
+        """
+        if news['subtitle']:
+            content_html += f"<h2>{news['subtitle']}</h2>"
+        if news['image_url']:
+            content_html += f'<img src="{news["image_url"]}" alt="{news["title"]}" style="max-width:100%;height:auto;"><br>'
+        else:
+            print(f"هشدار: تصویر برای {news['title']} یافت نشد.")
+        content_html += f"""
+        <p>{rewritten_content}</p>
+        <p><a href="{news['link']}" target="_blank">منبع</a></p>
+        """
+        
         # ایجاد پست
         post_body = {
             "kind": "blogger#post",
             "blog": {"id": BLOG_ID},
-            "title": title,
-            "content": content
+            "title": news["title"],
+            "content": content_html
         }
         posts = service.posts()
         request = posts.insert(blogId=BLOG_ID, body=post_body)
@@ -156,14 +189,10 @@ def main():
         print("خبر فیلتر شد و هیچ موردی برای انتشار باقی نماند.")
         return
     
-    # بازنویسی و انتشار
+    # انتشار خبر
     for news in filtered_news:
         print(f"در حال پردازش: {news['title']}")
-        rewritten_content = rewrite_with_gemini(news["content"])
-        if rewritten_content:
-            publish_to_blogger(news["title"], rewritten_content)
-        else:
-            print(f"بازنویسی برای {news['title']} ناموفق بود.")
+        publish_to_blogger(news)
         time.sleep(5)  # تأخیر 5 ثانیه برای جلوگیری از خطای 429
 
 if __name__ == "__main__":
