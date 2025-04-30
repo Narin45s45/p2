@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import feedparser
 import requests
 from google.oauth2.credentials import Credentials
@@ -15,24 +16,31 @@ RSS_FEEDS = [
     "https://newsbtc.com/feed/"
 ]
 
-# تابع برای دریافت خبرها از RSS
-def fetch_news():
+# تابع برای دریافت آخرین خبر از RSS
+def fetch_latest_news():
     news_items = []
     for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]:  # محدود به 5 خبر از هر منبع
+            if feed.entries:
+                entry = feed.entries[0]  # فقط اولین (جدیدترین) خبر
                 news_items.append({
                     "title": entry.title,
                     "content": entry.summary or entry.description,
-                    "link": entry.link
+                    "link": entry.link,
+                    "published": entry.get("published", "")  # برای مرتب‌سازی
                 })
         except Exception as e:
             print(f"خطا در دریافت فید {feed_url}: {e}")
-    return news_items
+    
+    # مرتب‌سازی بر اساس زمان انتشار و انتخاب جدیدترین
+    if news_items:
+        latest_news = sorted(news_items, key=lambda x: x["published"], reverse=True)[0]
+        return [latest_news]  # فقط آخرین خبر
+    return []
 
-# تابع برای ارسال درخواست به جمینی
-def call_gemini(prompt):
+# تابع برای ارسال درخواست به جمینی با مدیریت خطای 429
+def call_gemini(prompt, retries=3, delay=60):
     headers = {
         "Content-Type": "application/json",
     }
@@ -43,23 +51,30 @@ def call_gemini(prompt):
             }]
         }]
     }
-    try:
-        response = requests.post(
-            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
-            headers=headers,
-            json=data
-        )
-        if response.status_code == 200:
-            result = response.json()
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            print(f"خطا در درخواست جمینی: {response.text}")
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+                headers=headers,
+                json=data
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result["candidates"][0]["content"]["parts"][0]["text"]
+            elif response.status_code == 429:
+                print(f"خطای 429: محدودیت quota. منتظر {delay} ثانیه...")
+                time.sleep(delay)
+                continue
+            else:
+                print(f"خطا در درخواست جمینی: {response.text}")
+                return None
+        except Exception as e:
+            print(f"خطا در تماس با جمینی: {e}")
             return None
-    except Exception as e:
-        print(f"خطا در تماس با جمینی: {e}")
-        return None
+    print("تلاش‌ها برای درخواست جمینی ناموفق بود.")
+    return None
 
-# تابع برای فیلتر کردن خبرها با جمینی
+# تابع برای فیلتر کردن خبر با جمینی
 def filter_news_with_gemini(news_items):
     filtered_news = []
     for item in news_items:
@@ -70,6 +85,7 @@ def filter_news_with_gemini(news_items):
         متن: {item['title']} - {item['content']}
         """
         response = call_gemini(prompt)
+        time.sleep(5)  # تأخیر 5 ثانیه برای جلوگیری از خطای 429
         if response and response.strip() == "مجاز":
             filtered_news.append(item)
         else:
@@ -88,10 +104,15 @@ def rewrite_with_gemini(content):
 # تابع برای انتشار پست در بلاگر
 def publish_to_blogger(title, content):
     try:
+        # بررسی متغیر محیطی
+        credentials = os.environ.get("CREDENTIALS")
+        if not credentials:
+            raise ValueError("متغیر محیطی CREDENTIALS تنظیم نشده است.")
+        
         # بارگذاری اطلاعات احراز هویت
-        creds_info = json.loads(os.environ.get("BLOGGER_CREDS"))
+        creds_info = json.loads(credentials)
         if not all(k in creds_info for k in ['token', 'refresh_token', 'client_id', 'client_secret', 'scopes']):
-            raise ValueError("فایل CREDENTIALS ناقص است.")
+            raise ValueError("فایل CREDENTIALS ناقص است. کلیدهای لازم: token, refresh_token, client_id, client_secret, scopes")
         creds = Credentials.from_authorized_user_info(creds_info)
         
         # ایجاد سرویس بلاگر
@@ -118,8 +139,13 @@ def publish_to_blogger(title, content):
 
 # تابع اصلی
 def main():
-    # دریافت خبرها
-    news_items = fetch_news()
+    # بررسی کلید API جمینی
+    if not GEMINI_API_KEY:
+        print("کلید API جمینی (GEMAPI) تنظیم نشده است.")
+        return
+    
+    # دریافت آخرین خبر
+    news_items = fetch_latest_news()
     if not news_items:
         print("هیچ خبری دریافت نشد.")
         return
@@ -127,7 +153,7 @@ def main():
     # فیلتر کردن با جمینی
     filtered_news = filter_news_with_gemini(news_items)
     if not filtered_news:
-        print("هیچ خبری پس از فیلتر باقی نماند.")
+        print("خبر فیلتر شد و هیچ موردی برای انتشار باقی نماند.")
         return
     
     # بازنویسی و انتشار
@@ -138,6 +164,7 @@ def main():
             publish_to_blogger(news["title"], rewritten_content)
         else:
             print(f"بازنویسی برای {news['title']} ناموفق بود.")
+        time.sleep(5)  # تأخیر 5 ثانیه برای جلوگیری از خطای 429
 
 if __name__ == "__main__":
     main()
